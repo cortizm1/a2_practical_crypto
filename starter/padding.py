@@ -61,18 +61,28 @@ def pad_generator(pad_length: int, byte_candidate: int):
         error_writer(e, description="Unable to generate pad.")
 
 @function_logger_too
+def random_pad_byte(lastbyte: bytes, block_size: int):
+  try:
+    bool_ = True
+    while bool_:
+      random_pad_byte = randint(1, block_size)
+      bool_ = True if random_pad_byte == int(lastbyte) else False
+    return random_pad_byte
+  except Exception as e:
+    error_writer(e, description="Unable to generate pad.")
+
+@function_logger_too
 def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with PKCS#7 padding for `block_size` (see the module docstring)."""
     try:
         # we are thinking we are getting the chunk of the data here... chunking and serializing happend before this function
         pad_length_ = pad_lengther(len(data), block_size)
-        random_pad_byte = randint(1, block_size)
-        pad_ = pad_generator(pad_length_, random_pad_byte)
+        random_pad_byte_ = random_pad_byte(data[-1], block_size)
+        pad_ = pad_generator(pad_length_, random_pad_byte_)
 
         padded_bytes = b''.join([data, pad_])
 
         return padded_bytes
-
     except Exception as e:
         error_writer(e, description=f"{data} unable to pad byte-message (pkcs7).")
 
@@ -89,15 +99,33 @@ def reverse_pad_lengther(padded_data: bytes):
           range_ = i
           break
     
-    print(range_)
     return range_
   except Exception as e:
         error_writer(e, description="Unable to calculate length of pad.")
+
+def pad_exception_checker(data: bytes, block_size: int):
+  #Unpadding raises `ValueError` for an invalid block size, empty input,
+  #non-block-aligned input, or invalid padding.
+  if block_size > 255 or block_size < 1:
+    raise ValueError("Invalid block size.")
+
+  elif len(data) < 1:
+    raise ValueError("Empty input.")
+
+  elif len(data) % block_size != 0:
+    raise ValueError("Invalid padding.")
+
+  #non-block-aligned input... what is this haha
+
+  else:
+    pass
 
 @function_logger_too
 def pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with valid PKCS#7 padding removed, or raise ValueError."""
     try:
+        _ = pad_exception_checker(data, block_size)
+
         pad_length_ = reverse_pad_lengther(data)
         unpadded_data = data[:-(pad_length_)]
         return unpadded_data
