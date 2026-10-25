@@ -41,12 +41,50 @@ explanation of why padding is always added. Write the first version of these
 functions and examples without generated code or a library padding helper.
 """
 
+from utils import function_logger, function_logger_too, error_writer
+from random import randint
 
+@function_logger_too
+def pad_lengther(data_length: int, block_size:int):
+  try:
+    pad_length = block_size if abs(data_length-block_size) == 0 else abs(data_length-block_size)
+    return pad_length
+  except Exception as e:
+        error_writer(e, description="Unable to calculate length of pad.")
+
+@function_logger_too
+def pad_generator(pad_length: int, byte_candidate: int):
+  try:
+    pad_ = b''.join([bytes([byte_candidate]) for i in range(0, pad_length)])
+    return pad_
+  except Exception as e:
+        error_writer(e, description="Unable to generate pad.")
+
+@function_logger_too
 def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with PKCS#7 padding for `block_size` (see the module docstring)."""
-    raise NotImplementedError("Complete the independent padding warmup")
+    try:
+        # we are thinking we are getting the chunk of the data here... chunking and serializing happend before this function
+        pad_length_ = pad_lengther(len(data), block_size)
+        random_pad_byte = randint(1, block_size)
+        pad_ = pad_generator(pad_length_, random_pad_byte)
 
+        padded_bytes = b''.join([data, pad_])
 
+        return padded_bytes
+
+    except Exception as e:
+        error_writer(e, description=f"{data} unable to pad byte-message (pkcs7).")
+
+@function_logger_too
 def pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with valid PKCS#7 padding removed, or raise ValueError."""
-    raise NotImplementedError("Complete the independent padding warmup")
+    try:
+        pass
+    except Exception as e:
+        error_writer(e, description=f"{data} unable to unpad byte-message (pkcs7).")
+
+
+#test_bytes = bytes([5, 7])
+#test = pkcs7_pad(test_bytes, 16)
+#print(test)
