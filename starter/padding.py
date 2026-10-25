@@ -109,7 +109,7 @@ def pad_exception_checker(data: bytes, block_size: int):
   if block_size > 255 or block_size < 1:
     raise ValueError("Invalid block size.")
 
-  elif len(data) < 1:
+  elif data is None:
     raise ValueError("Empty input.")
 
   elif len(data) % block_size != 0:
@@ -134,4 +134,8 @@ def pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
 
 test_bytes = bytes([5, 7])
 test = pkcs7_pad(test_bytes, 16)
+test_ = pkcs7_unpad(test, 16)
+
+test_bytes_2 = bytes()
+test = pkcs7_pad(test_bytes_2, 16)
 test_ = pkcs7_unpad(test, 16)
