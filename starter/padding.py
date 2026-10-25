@@ -76,15 +76,34 @@ def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
     except Exception as e:
         error_writer(e, description=f"{data} unable to pad byte-message (pkcs7).")
 
+@function_logger
+def reverse_pad_lengther(padded_data: bytes):
+  try:
+    pad_n = padded_data[-1]
+    range_ = len(padded_data)
+
+    for i, n in enumerate(padded_data):
+        if int(padded_data[-(i+1)]) == int(pad_n):
+          pass
+        else:
+          range_ = i
+          break
+    
+    print(range_)
+    return range_
+  except Exception as e:
+        error_writer(e, description="Unable to calculate length of pad.")
+
 @function_logger_too
 def pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
     """Return `data` with valid PKCS#7 padding removed, or raise ValueError."""
     try:
-        pass
+        pad_length_ = reverse_pad_lengther(data)
+        unpadded_data = data[:-(pad_length_)]
+        return unpadded_data
     except Exception as e:
         error_writer(e, description=f"{data} unable to unpad byte-message (pkcs7).")
 
-
-#test_bytes = bytes([5, 7])
-#test = pkcs7_pad(test_bytes, 16)
-#print(test)
+test_bytes = bytes([5, 7])
+test = pkcs7_pad(test_bytes, 16)
+test_ = pkcs7_unpad(test, 16)
