@@ -1,0 +1,21 @@
+[project]
+name = "a2"
+version = "0.1.0"
+description = "Yet another JMessage client implementation."
+readme = "README.md"
+authors = [
+    { name = "Carlos Ortiz", email = "cortizm1@jh.edu" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "cffi==2.0.0",
+    "cryptography==49.0.0",
+    "pycparser==3.0",
+]
+
+[project.scripts]
+a2 = "a2:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
