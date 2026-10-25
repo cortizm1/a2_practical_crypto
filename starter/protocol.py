@@ -71,6 +71,10 @@ Rules that apply everywhere
   writing magic numbers.
 """
 
+from utils import function_logger, function_logger_too, error_writer
+import jmessage_support.messages as spm
+from cryptography.hazmat.primitives import hashes
+
 
 class Client:
     """The handout §3 protocol-core interface. One instance per local account.
@@ -127,6 +131,7 @@ class Client:
         self.jm1_only = jm1_only
         # TODO: Design your handshake and session state. See specification §6.9.
 
+
     # ----- 2. Fingerprint (§5) -----------------------------------------------
     # Core zone (AGENTS.md, "Core"). A good first function: it exercises
     # hashing, byte concatenation and formatting, and you can check it against
@@ -156,7 +161,22 @@ class Client:
             No state has changed and nothing has been emitted. Displaying a
             fingerprint does not authenticate it (§5).
         """
-        raise NotImplementedError("Implement fingerprint in protocol.py")
+        try:
+
+            digest = hashes.Hash(hashes.SHA256())
+            idSK_ = self.identity_private_key
+            idPK_ = self.lookup_peer_key # missing lookup as a function
+            
+            byted_text = b"".join([str.encode(idSK_), str.encode(idPK_)])
+            digest.update(byted_text)
+            digest_ = digest.finalize()
+            print(digest_)
+            digest_ = digest_.hex()
+
+            return digest_
+        except Exception as e:
+            error_writer(e, description="Unable to fetch/hash the fingerprint.")
+
 
     # ----- 3. Handshake as initiator (§§6.3, 6.5, 6.6, 6.8) ------------------
     # Review-critical (AGENTS.md "What counts as explained": rows "Transcript &
@@ -373,3 +393,8 @@ class Client:
         Returns:
             None.
         """
+
+client = Client("pipipupu", "kkk", "woohoo", 10, True)
+fingerprint_ = client.fingerprint()
+
+print(fingerprint_)
