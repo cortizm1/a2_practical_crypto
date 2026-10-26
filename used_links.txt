@@ -1,1 +1,2 @@
 https://www.geeksforgeeks.org/python/how-to-convert-int-to-bytes-in-python/
+https://cryptography.io/en/latest/hazmat/primitives/cryptographic-hashes/

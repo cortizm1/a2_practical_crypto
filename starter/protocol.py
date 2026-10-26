@@ -71,9 +71,51 @@ Rules that apply everywhere
   writing magic numbers.
 """
 
-from utils import function_logger, function_logger_too, error_writer
+from utils import logged, error_writer
 import jmessage_support.messages as spm
+
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from jmessage_support.identity import public_bytes
+from jmessage_support.transport import PeerKeyUnavailable
+
+from dataclasses import dataclass, field
+import os
+
+
+# Handshake / session states (spec §6.9 state table).
+PENDING_REPLY = "pending-reply"      # I sent HELLO, waiting for REPLY
+PENDING_FINISH = "pending-finish"    # R sent REPLY, waiting for FINISH
+ESTABLISHED = "established"
+
+
+@dataclass
+class Session:
+    """One entry of Client.sessions, keyed by sid (your Q1 answer: option b).
+
+    Q: why is the dict keyed by sid and not by peer name?
+    Q: which of these fields is a secret, and when may it be discarded?
+    Q: why keep `hello` as the exact bytes instead of the parsed fields?
+    """
+    sid: bytes
+    peer: str
+    role: str                       # "I" (initiator) or "R" (responder)
+    state: str                      # PENDING_REPLY / PENDING_FINISH / ESTABLISHED
+    peer_idpk: bytes                # pinned once at handshake start (§5)
+    hello: bytes                    # exact HELLO bytes sent (I) or received (R)
+    started: float                  # self.now() at creation (Appendix B expiry)
+    x_priv: X25519PrivateKey | None = None       # ephemeral; secret; drop after keys derived
+    kem_priv: MLKEM768PrivateKey | None = None   # ephemeral (JM2, I only); secret
+    offered: tuple = ()             # suites offered in HELLO (I) — needed for §6.5 step 1
+    retry_used: bool = False        # the single hybrid_invalid fallback (§6.8)
+    reply: bytes = b""              # exact REPLY bytes, filled in later (§6.6, §6.7)
+    suite: int | None = None        # chosen suite, filled in from REPLY / at HELLO processing
+    keys: dict = field(default_factory=dict)     # directional record keys, filled by key schedule
+    send_seq: int = 0
+    recv_seq: int = 0
 
 
 class Client:
@@ -129,7 +171,11 @@ class Client:
         self.emit = emit
         self.now = now
         self.jm1_only = jm1_only
-        # TODO: Design your handshake and session state. See specification §6.9.
+        # §6.9 state, as designed in the handshake Q/A:
+        self.sessions = {}      # sid (bytes) -> Session           (Q1: one entry per handshake/session)
+        self.retired = set()    # sids never to be reused            (Q3.1: consulted when a HELLO arrives)
+        self.queued = {}        # peer -> [text, ...]                (Q3.2: drained on establishment)
+        self.latest = {}        # peer -> sid of newest established  (Q3.3: read by send_text)
 
 
     # ----- 2. Fingerprint (§5) -----------------------------------------------
@@ -137,7 +183,7 @@ class Client:
     # hashing, byte concatenation and formatting, and you can check it against
     # the course server's `echo` fingerprint in handout §3 and the values in
     # spec Appendix A.
-
+    @logged
     def fingerprint(self, peer=None):
         """Return the §5 display string for self, or a named peer.
 
@@ -161,22 +207,17 @@ class Client:
             No state has changed and nothing has been emitted. Displaying a
             fingerprint does not authenticate it (§5).
         """
-        try:
+        # signature
 
-            digest = hashes.Hash(hashes.SHA256())
-            idSK_ = self.identity_private_key
-            idPK_ = self.lookup_peer_key # missing lookup as a function
+        idPK_ = self.lookup_peer_key(peer) if peer else public_bytes(self.identity_private_key)
+        byted_text = b"JMessage-2026 fingerprint" +  idPK_
             
-            byted_text = b"".join([str.encode(idSK_), str.encode(idPK_)])
-            digest.update(byted_text)
-            digest_ = digest.finalize()
-            print(digest_)
-            digest_ = digest_.hex()
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(byted_text)
+        digest_ = digest.finalize()
+        fingerprint = digest_[:10].hex(" ", 1).upper()
 
-            return digest_
-        except Exception as e:
-            error_writer(e, description="Unable to fetch/hash the fingerprint.")
-
+        return fingerprint
 
     # ----- 3. Handshake as initiator (§§6.3, 6.5, 6.6, 6.8) ------------------
     # Review-critical (AGENTS.md "What counts as explained": rows "Transcript &
@@ -193,6 +234,7 @@ class Client:
     # what each failure does (abort for a REPLY, ignore for a bad REJECT
     # signature, §6.8).
 
+    @logged
     def start_handshake(self, peer):
         """Begin a fresh handshake (§6), even if another session exists.
 
@@ -217,7 +259,44 @@ class Client:
             when `jm1_only` is set (§6.1); ek_I is present exactly when JM2 is
             offered (§6.3). Any existing sessions with `peer` are unaffected.
         """
-        raise NotImplementedError("Implement start_handshake in protocol.py")
+
+        # Q: why does the key lookup happen before any random value is drawn?
+        # Q: what would go wrong if `sid` collided with an entry in self.retired?
+        # Q: for the default offer, which half of the ML-KEM pair travels in ek_I?
+
+        # Q5: pin the peer's identity key first; on failure report and stop (§5).
+        try:
+            peer_idpk = self.lookup_peer_key(peer)
+        except PeerKeyUnavailable as e:
+            self.emit({"type": "error", "peer": peer, "message": f"cannot start handshake: {e}"})
+            return
+
+        # Q4: fresh sid from the OS CSPRNG (§2, §6.3). Added rule: a sid must
+        # not be "in use" (§6.4 step 1), so redraw on the vanishingly rare clash.
+        sid = os.urandom(spm.SID_LEN)
+        while sid in self.sessions or sid in self.retired:
+            sid = os.urandom(spm.SID_LEN)
+
+        # Q4: ephemeral X25519 pair; ML-KEM pair only when JM2 is offered.
+        x_priv = X25519PrivateKey.generate()
+        x_pub = x_priv.public_key().public_bytes_raw()
+        if self.jm1_only:
+            suites = (spm.JM1,)                 # §6.1 compatibility offer
+            kem_priv, ek = None, b""            # ek_I MUST be empty without JM2 (§3)
+        else:
+            suites = (spm.JM2, spm.JM1)         # §6.1: this order, JM2 first
+            kem_priv = MLKEM768PrivateKey.generate()
+            ek = kem_priv.public_key().public_bytes_raw()   # 1184 bytes (§2)
+
+        hello = spm.encode_hello(sid, suites, x_pub, ek)
+
+        # Q2: everything the pending-reply entry retains until REPLY (§6.9).
+        self.sessions[sid] = Session(
+            sid=sid, peer=peer, role="I", state=PENDING_REPLY,
+            peer_idpk=peer_idpk, hello=hello, started=self.now(),
+            x_priv=x_priv, kem_priv=kem_priv, offered=suites,
+        )
+        self.emit({"type": "send", "to": peer, "body": hello})
 
     # ----- 4. Handshake as responder (§§6.2, 6.4, 6.5, 6.6) ------------------
     # Review-critical (AGENTS.md "What counts as explained": rows "Transcript &
@@ -236,6 +315,7 @@ class Client:
     # its sid. §3 says which malformed HELLOs are discarded silently and which
     # reach §6.4 step 3.
 
+    @logged
     def receive(self, sender, recipient, body):
         """Process a decoded binary body; emit outputs through self.emit.
 
@@ -302,6 +382,7 @@ class Client:
     # RECEIPT plus delivery (or a local error for invalid UTF-8). Use your
     # Part 0 `pkcs7_pad`/`pkcs7_unpad` for JM1.
 
+    @logged
     def send_text(self, peer, text):
         """Send or queue text using the appropriate session (§§6.9 and 7).
 
@@ -351,6 +432,7 @@ class Client:
     # exist; they may remain no-ops. The supplied driver stops on any transport
     # failure, so it does not depend on them.
 
+    @logged
     def check_timeouts(self):
         """Optional Appendix B robustness; this method may remain a no-op.
 
@@ -363,6 +445,7 @@ class Client:
             None.
         """
 
+    @logged
     def reset_peer_trust(self, peer):
         """Optional Appendix B robustness; this method may remain a no-op.
 
@@ -378,6 +461,7 @@ class Client:
             None.
         """
 
+    @logged
     def transport_failed(self, peer=None):
         """Optional Appendix B robustness; the supplied live driver stops on failure.
 
@@ -393,8 +477,3 @@ class Client:
         Returns:
             None.
         """
-
-client = Client("pipipupu", "kkk", "woohoo", 10, True)
-fingerprint_ = client.fingerprint()
-
-print(fingerprint_)

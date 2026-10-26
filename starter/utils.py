@@ -1,31 +1,35 @@
 import datetime
-
+import functools
 import logging
 
 logging.basicConfig(filename='a2.log', level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-def function_logger(func, *args): #
-    def wrapper(args):
-        try:
-            t = datetime.datetime.now()
-            logger.info(f"{t}\tExecuting {func.__name__}.") 
-            return func(args)
-        except Exception as e:
-                error_writer(e, description=f"Wrapper error.")
-    return wrapper
 
-# tuple unpacking kwargs and all of that didn't work for a two param function... brittle code but I'm rusty
-def function_logger_too(func, *args, **kwargs): #
-    def wrapper(args, kwargs):
-        try:
-            t = datetime.datetime.now()
-            logger.info(f"{t}\tExecuting {func.__name__}.") 
-            return func(args, kwargs)
-        except Exception as e:
-                error_writer(e, description=f"Wrapper error.")
-    return wrapper
-
-def error_writer(e:Exception, description:str):
+def error_writer(e: Exception, description: str):
     t = datetime.datetime.now()
     logger.error(f"{t}\t{description}\t{e}")
+
+
+def logged(func):
+    """Log entry and any exception, then re-raise it unchanged.
+
+    The decorator never swallows: the spec gives each exception a meaning
+    (ValueError from pkcs7_unpad, DecodeError -> discard, PeerKeyUnavailable
+    -> error event), so the function that knows the spec decides what to
+    catch. Everything else must crash loudly so you find it.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        logger.info(f"{datetime.datetime.now()}\tExecuting {func.__name__}.")
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_writer(e, description=f"{func.__name__} raised")
+            raise
+    return wrapper
+
+
+# Old names kept so existing decorators in padding.py / protocol.py keep working.
+function_logger = logged
+function_logger_too = logged
