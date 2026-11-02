@@ -144,7 +144,12 @@ class _RecordChecks:
     def test_tampered_record_gets_resend_and_seq_stays(self):
         rec, client, session, _sender, receiver = self._first()
         body = bytearray(rec["data"])
-        body[-1] ^= 0x01                      # last byte: tag (JM2) or last CBC block (JM1)
+        if self.suite == spm.JM2:
+            body[-1] ^= 0x01                  # last byte of the GCM tag
+        else:
+            body[25] ^= 0x01                  # first IV byte: garbles only the first plaintext block
+            # (tag bytes), so the padding stays valid and the failure is the MAC, not "malformed";
+            # flipping the last CBC block would garble the padding and be a silent discard (§7.2 3.2)
         client._open(session, spm.parse_data(bytes(body)))
         sends = self.h.sends(receiver)
         self.assertEqual(len(sends), 1)
