@@ -74,17 +74,25 @@ Rules that apply everywhere
 from utils import logged, error_writer
 import jmessage_support.messages as spm
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from jmessage_support.identity import public_bytes
-from jmessage_support.transport import PeerKeyUnavailable
-
-from dataclasses import dataclass, field
 import os
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey, MLKEM768PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.primitives.ciphers.modes import CBC
+from cryptography.hazmat.primitives.hmac import HMAC
+from jmessage_support.identity import public_bytes
+from jmessage_support.transport import PeerKeyUnavailable
+from jmessage_support.codec import DecodeError, str8, u16, u32, u64
+
+from padding import pkcs7_pad, pkcs7_unpad
+
+from dataclasses import dataclass, field
 
 # Handshake / session states (spec §6.9 state table).
 PENDING_REPLY = "pending-reply"      # I sent HELLO, waiting for REPLY
@@ -113,9 +121,13 @@ class Session:
     retry_used: bool = False        # the single hybrid_invalid fallback (§6.8)
     reply: bytes = b""              # exact REPLY bytes, filled in later (§6.6, §6.7)
     suite: int | None = None        # chosen suite, filled in from REPLY / at HELLO processing
+    ikm: bytes = b""               # ss_pq || dh (JM2) or dh (JM1); secret; consumed by the key schedule
     keys: dict = field(default_factory=dict)     # directional record keys, filled by key schedule
     send_seq: int = 0
     recv_seq: int = 0
+    cached_data: dict = field(default_factory=dict)
+    receipts_seqs: set = field(default_factory=set)
+    resent_seqs: set = field(default_factory=set)
 
 
 class Client:
@@ -352,8 +364,243 @@ class Client:
         Afterwards:
             Exactly the state change the §6.9 table allows for this message in
             the current state, or none at all.
+
+        Dispatch map (first byte of `body`, spm.T_*):
+            T_HELLO   -> self._on_hello(sender, body)      (exists)
+            T_REPLY   -> self._on_reply(sender, body)      (exists; does its own state gate)
+            T_FINISH  -> self._on_finish(sender, body)     (yours, stub below)
+            T_REJECT  -> self._on_reject(sender, body)     (agent, later; stub below)
+            T_DATA    -> parse with spm.parse_data, find the session by sid,
+                         check peer == sender and state == ESTABLISHED, then
+                         self._open(session, data)         (yours, stub below)
+            T_RECEIPT / T_RESEND -> spm.parse_control, same gates, then
+                         self._on_control(session, ctl)    (agent, later; stub below)
+            anything else, or a DecodeError from any parser -> silent return.
         """
         raise NotImplementedError("Implement receive in protocol.py")
+
+    # ----- 3a. Initiator helpers (agent-written after the Q7/Q8 + quiz description)
+
+    def _abort(self, session, why):
+        """Abandon a pending handshake: drop its state, retire the sid, report (§6.9)."""
+        self.sessions.pop(session.sid, None)
+        self.retired.add(session.sid)
+        self.emit({"type": "error", "peer": session.peer, "message": f"handshake aborted: {why}"})
+
+    def _establish(self, session):
+        """Mark a session established and do the §6.9 bookkeeping.
+
+        Called by `_on_reply` (I, after FINISH is accepted by the server) and
+        by your `_on_finish` (R, after sig_I verifies).
+        Q: why is `latest[peer]` overwritten here even if an older session exists?
+        """
+        session.state = ESTABLISHED
+        session.send_seq = session.recv_seq = 0
+        session.x_priv = session.kem_priv = None
+        self.latest[session.peer] = session.sid
+        self.emit({"type": "established", "peer": session.peer,
+                   "sid": session.sid, "suite": session.suite})
+        for text in self.queued.pop(session.peer, []):
+            self.send_text(session.peer, text)       # your send_text (§6.9 queued text)
+
+    @logged
+    def _on_reply(self, sender, body):
+        """Initiator's REPLY processing, spec §6.5 steps 1-5, then FINISH (§6.6).
+
+        Q: which HELLO bytes go into TH_R here, and where did they come from?
+        Q: which key verifies sig_R, and when was it pinned?
+        Q: a REPLY from the wrong peer is discarded; a bad signature aborts. Why the difference?
+        """
+        try:
+            reply = spm.parse_reply(body)
+        except DecodeError:
+            return
+        session = self.sessions.get(reply.sid)
+        # Out of state, wrong peer, or unknown sid: silent discard, no state change (§6.5, §6.9).
+        if session is None or session.state != PENDING_REPLY or session.peer != sender:
+            return
+        # Step 1: a supported suite that we offered; ct length matches the suite.
+        if reply.suite not in session.offered or reply.suite not in spm.PREFERENCE:
+            return self._abort(session, "REPLY chose a suite we did not offer")
+        want_ct = spm.MLKEM_CT_LEN if reply.suite == spm.JM2 else 0
+        if len(reply.ct) != want_ct:
+            return self._abort(session, "REPLY ciphertext length is wrong for the suite")
+        # Step 2: TH_R over the HELLO bytes *we sent*; verify sig_R under the pinned idPK_R.
+        th_r = self._transcript(b"JMessage-2026 TH-R", self.username, sender, session.hello, reply.core)
+        try:
+            Ed25519PublicKey.from_public_bytes(session.peer_idpk).verify(
+                reply.sig, b"JMessage-2026 responder" + th_r)
+        except (InvalidSignature, ValueError):
+            return self._abort(session, "REPLY signature invalid")
+        # Steps 3-4: dh with our retained x_I; for JM2, decapsulate with our retained dk_I.
+        try:
+            dh = self._x25519(session.x_priv, reply.x_pub)
+            ss_pq = session.kem_priv.decapsulate(reply.ct) if reply.suite == spm.JM2 else b""
+        except Exception as e:
+            return self._abort(session, f"key agreement failed: {type(e).__name__}")
+        # Step 5: keys, then FINISH.
+        session.reply = body
+        session.suite = reply.suite
+        session.ikm = ss_pq + dh
+        try:
+            self._derive_keys(session, self.username, sender)
+            th_i = self._transcript(b"JMessage-2026 TH-I", self.username, sender, session.hello, body)
+            finish = spm.encode_finish(session.sid, self._sign(b"JMessage-2026 initiator" + th_i))
+        except Exception as e:
+            return self._abort(session, f"key schedule failed: {type(e).__name__}")
+        # §6.6: established for I once the server has accepted the FINISH send.
+        self.emit({"type": "send", "to": sender, "body": finish})
+        self._establish(session)
+
+    # ----- 4a. Responder helpers (agent-written after the Q6-Q8 description) ---
+    # `receive` (yours) dispatches T_HELLO to `_on_hello`. Nothing here is
+    # reachable until `receive` calls it.
+
+    def _transcript(self, label, initiator, responder, *parts):
+        """SHA256(label || str8(I) || str8(R) || parts...), spec §§6.5-6.7.
+
+        Q: why are the usernames length-prefixed (str8) rather than raw?
+        """
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(label)
+        digest.update(str8(initiator))
+        digest.update(str8(responder))
+        for part in parts:
+            digest.update(part)
+        return digest.finalize()
+
+    def _sign(self, message):
+        """Ed25519 signature under this client's identity key (§5)."""
+        return Ed25519PrivateKey.from_private_bytes(self.identity_private_key).sign(message)
+
+    @staticmethod
+    def _x25519(x_priv, peer_pub_bytes):
+        """dh = exchange(x_priv, peer X25519 public), with the §2 all-zero check.
+
+        A library error (bad public key) propagates; the caller treats it as
+        a handshake abort, never as a reason to fall back (§2).
+        """
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+        dh = x_priv.exchange(X25519PublicKey.from_public_bytes(peer_pub_bytes))
+        if dh == bytes(len(dh)):
+            raise ValueError("all-zero X25519 shared secret")
+        return dh
+
+    @logged
+    def _send_reject(self, initiator, sid, reason):
+        """Build, sign and send REJECT (§6.8); retire the sid (§6.4 step 5)."""
+        # Q: which bytes does the REJECT signature cover, and why is str8(I) in there?
+        signed = b"JMessage-2026 reject" + sid + bytes([reason]) + str8(initiator)
+        self.retired.add(sid)
+        self.emit({"type": "send", "to": initiator,
+                   "body": spm.encode_reject(sid, reason, self._sign(signed))})
+
+    @logged
+    def _on_hello(self, sender, body):
+        """Responder's HELLO processing, spec §6.4 steps 1-5 (your Q6).
+
+        Q: why is the identity-key lookup (step 4) after the REJECT cases?
+        Q: which copy of HELLO goes into TH_R here, and which copy will Alice use?
+        Q: what is stored if step 5 raises, and what is sent?
+        """
+        # Step 1: parse; a structurally bad HELLO or an in-use sid is discarded.
+        try:
+            hello = spm.parse_hello(body)
+        except DecodeError:
+            return
+        if hello.sid in self.sessions or hello.sid in self.retired:
+            return
+        # Step 2: responder's fixed preference order, not the initiator's.
+        suite = next((s for s in spm.PREFERENCE if s in hello.suites), None)
+        if suite is None:
+            self._send_reject(sender, hello.sid, spm.REASON_NO_COMMON_SUITE)
+            return
+        # Step 3: JM2 needs a valid 1184-byte ek_I; import or Encaps failure
+        # is the same failure (§6.4 step 3) -> hybrid_invalid.
+        ss_pq, ct = b"", b""
+        if suite == spm.JM2:
+            try:
+                if len(hello.ek) != spm.MLKEM_EK_LEN:
+                    raise ValueError("ek_I length")
+                ss_pq, ct = MLKEM768PublicKey.from_public_bytes(hello.ek).encapsulate()
+            except Exception:
+                self._send_reject(sender, hello.sid, spm.REASON_HYBRID_INVALID)
+                return
+        # Step 4: pin I's identity key; unavailable -> retire, report, send nothing.
+        try:
+            peer_idpk = self.lookup_peer_key(sender)
+        except PeerKeyUnavailable as e:
+            self.retired.add(hello.sid)
+            self.emit({"type": "error", "peer": sender, "message": f"cannot answer HELLO: {e}"})
+            return
+        x_priv = X25519PrivateKey.generate()
+        x_pub = x_priv.public_key().public_bytes_raw()
+        # Step 5: dh, REPLY, (keys); store pending-finish and send only if all succeed.
+        try:
+            dh = self._x25519(x_priv, hello.x_pub)
+            core = spm.encode_reply_core(hello.sid, suite, x_pub, ct)
+            th_r = self._transcript(b"JMessage-2026 TH-R", sender, self.username, body, core)
+            reply = core + self._sign(b"JMessage-2026 responder" + th_r)
+            ikm = ss_pq + dh                      # JM1: ss_pq is empty, so ikm = dh (§6.7)
+        except Exception as e:
+            self.emit({"type": "error", "peer": sender, "message": f"handshake failed: {type(e).__name__}"})
+            return
+        session = Session(
+            sid=hello.sid, peer=sender, role="R", state=PENDING_FINISH,
+            peer_idpk=peer_idpk, hello=body, started=self.now(),
+            suite=suite, reply=reply, ikm=ikm,   # x_priv not kept: dh is done (§6.9 "discard ephemeral secrets")
+        )
+        try:
+            self._derive_keys(session, sender, self.username)   # §6.4 step 5: keys before REPLY goes out
+        except Exception as e:
+            self.emit({"type": "error", "peer": sender, "message": f"handshake failed: {type(e).__name__}"})
+            return
+        self.sessions[hello.sid] = session
+        self.emit({"type": "send", "to": sender, "body": reply})
+
+    @logged
+    def _on_finish(self, sender, body):
+        """Responder's FINISH processing (§6.6 second half, §6.9). YOURS to write.
+
+        Called by your `receive` for type 0x03 once the session, peer and
+        pending-finish gates have passed.
+        Steps the spec requires, in order:
+          1. parse with `spm.parse_finish`; a malformed body is discarded silently;
+          2. recompute the transcript hash exactly as the initiator signs it
+             (§6.6: same label, same order of usernames and bytes; see
+             `_transcript` and the signing input used in `_on_reply`);
+          3. verify sig_I with the *pinned* `session.peer_idpk`
+             (`Ed25519PublicKey.from_public_bytes(...).verify`), never with a
+             fresh directory lookup;
+          4. on failure: `self._abort(session, ...)` (§6.9: a failed FINISH
+             verification is reported, never raised);
+          5. on success: `self._establish(session)`.
+        Q: why must the FINISH signature be checked against the key pinned at
+           HELLO time rather than the directory's current key?
+        """
+        raise NotImplementedError("Implement _on_finish in protocol.py")
+
+    # ----- 4b. Key schedule (§6.7), written after your description ------------
+
+    @logged
+    def _derive_keys(self, session, initiator, responder):
+        """Fill session.keys from session.ikm and the exact HELLO/REPLY bytes (§6.7).
+
+        Q: the salt is public. What does putting TH there bind the keys to?
+        Q: Bob is R. Which of the IR/RI keys does he *send* with?
+        Q: why must session.ikm be discarded after this call?
+        """
+        th = self._transcript(b"JMessage-2026 keys", initiator, responder,
+                              session.hello, session.reply)
+        length = 64 if session.suite == spm.JM2 else 96
+        okm = HKDF(algorithm=hashes.SHA256(), length=length, salt=th,
+                   info=b"JMessage-2026 " + u16(session.suite)).derive(session.ikm)
+        if session.suite == spm.JM2:
+            session.keys = {"k_IR": okm[:32], "k_RI": okm[32:]}
+        else:
+            session.keys = {"enc_IR": okm[0:16], "mac_IR": okm[16:48],
+                            "enc_RI": okm[48:64], "mac_RI": okm[64:96]}
+        session.ikm = b""        # §6.9: discard ephemeral secrets once used
 
     # ----- 5. Key schedule (§6.7) ---------------------------------------------
     # Review-critical (AGENTS.md "What counts as explained": row "Key
@@ -381,6 +628,43 @@ class Client:
     # ordered steps, whose outcomes are a silent discard, a RESEND, or a
     # RECEIPT plus delivery (or a local error for invalid UTF-8). Use your
     # Part 0 `pkcs7_pad`/`pkcs7_unpad` for JM1.
+    
+    @logged
+    def _seal(self, session, text_bytes):    # DATA body; allocates and advances send_seq; caches it
+
+        #couple of checks, we good, ok then we seq + 1
+        candidate_send_seq = session.send_seq
+
+        #JM1
+        if session.suite == spm.JM1:
+            key = session.keys["enc_IR"] if session.role =="I" else session.keys["enc_RI"]
+            mac = session.keys["mac_IR"] if session.role =="I" else session.keys["mac_RI"]
+
+            h = HMAC(mac, hashes.SHA256())
+            h.update(session.sid + u64(candidate_send_seq) + text_bytes)
+            T = h.finalize()
+            P  = pkcs7_pad(text_bytes + T, 16)
+            iv = os.urandom(16)
+
+            algorithm = algorithms.AES(key)
+
+            cipher = Cipher(algorithm, mode=CBC(iv))
+            encryptor = cipher.encryptor()
+            ct = encryptor.update(P) + encryptor.finalize()
+            protected = iv + ct
+
+        else:
+            key = session.keys["k_IR"] if session.role =="I" else session.keys["k_RI"]
+
+            aesgcm = AESGCM(key)
+            nonce_ = u32(0) + u64(candidate_send_seq)
+            aad_ = session.sid + u64(candidate_send_seq)
+            protected = aesgcm.encrypt(nonce=nonce_, data=text_bytes, associated_data=aad_)
+
+        data = spm.encode_data(session.sid, candidate_send_seq, protected)
+        session.send_seq = candidate_send_seq + 1
+        session.cached_data[candidate_send_seq] = data
+        return data
 
     @logged
     def send_text(self, peer, text):
@@ -413,7 +697,31 @@ class Client:
             * Otherwise the text is queued for `peer`, to be sent on whichever
               session with that peer is established first (§6.9).
         """
-        raise NotImplementedError("Implement send_text in protocol.py")
+        session =  self.sessions.get(self.latest.get(peer))
+
+        try:
+            byted_text = text.encode("utf-8")
+
+            if len(byted_text) > int(4096):
+                self.emit({"type": "error", "peer": peer, "message": f"Message too long."})
+                return
+        except UnicodeEncodeError as e:
+            self.emit({"type": "error", "peer": peer, "message": f"Message too long."})
+            return
+
+        if session is None:
+            if len([s for s in self.sessions.values() if s.peer == peer and s.state in (PENDING_FINISH, PENDING_REPLY)]) < 1:
+                self.start_handshake(peer)
+
+            self.queued.setdefault(peer, []).append(text)
+            return
+
+        if session.state != ESTABLISHED:
+            self.queued.setdefault(peer, []).append(text)
+            return
+        
+        data = self._seal(session, byted_text)
+        self.emit({"type": "send", "to": peer, "body": data})
 
     # ----- 7. Control messages (§7.3) -------------------------------------------
     # Part of AGENTS.md "What counts as explained", row "Record receive".
@@ -426,6 +734,57 @@ class Client:
     # on RESEND, either warn, or resend the exact cached DATA body (at most
     # once per record), never a re-encryption. Both messages are
     # unauthenticated: a RECEIPT is a delivery indication, not proof.
+
+    @logged
+    def _open(self, session, data):
+        """Open one DATA record for an established session (§7.2). YOURS to write.
+
+        `data` is a parsed `spm.Data` (fields sid, seq, protected); `receive`
+        has already matched sid, peer and state. The five ordered §7.2 steps:
+          1. length: `protected` too short for the suite -> silent discard;
+          2. `data.seq != session.recv_seq` -> silent discard (duplicate or
+             out of order, §7.1);
+          3. decrypt with the *peer's* direction key (role I opens RI, role R
+             opens IR); JM2: `AESGCM(k).decrypt(nonce, protected, aad)`;
+             JM1: AES-128-CBC decrypt then `pkcs7_unpad`, then split the
+             32-byte tag off the end and compare HMACs with `hmac.compare_digest`;
+          4. bad JM1 padding -> malformed, silent; tag/MAC failure -> send
+             RESEND (`spm.encode_control(spm.T_RESEND, sid, seq)`),
+             recv_seq unchanged;
+          5. authenticated: `recv_seq += 1`, send RECEIPT naming that seq, then
+             decode UTF-8 and check <= 4096 bytes; a format failure is a local
+             "error" event, still receipted, never a RESEND.
+        Emits: "message" {peer, sid, seq, text}, "send" {to, body}, "error".
+        """
+        raise NotImplementedError("Implement _open in protocol.py")
+
+    @logged
+    def _on_control(self, session, ctl):
+        """RECEIPT / RESEND for an established session (§7.3).
+
+        Agent-written helper, to be filled in after `_open`, `receive`,
+        `send_text` and `_on_finish` exist (AGENTS.md: named helper, every
+        added rule listed). `ctl` is a parsed `spm.Control` (kind, sid, seq).
+        Rules it will implement: accept only a seq this session has already
+        sent (`seq < session.send_seq`); report a RECEIPT once per seq
+        (`session.receipts_seqs`); on RESEND replay `session.cached_data[seq]`
+        at most once (`session.resent_seqs`), else a "warning"; never answer a
+        control message with a control message.
+        """
+        raise NotImplementedError("_on_control is written after your three functions")
+
+    @logged
+    def _on_reject(self, sender, body):
+        """REJECT handling and the single hybrid_invalid fallback (§6.8).
+
+        Agent-written helper, same condition as `_on_control`. Will implement:
+        verify the signature with the pinned key (invalid -> ignore, handshake
+        stays pending); `hybrid_invalid` with `retry_used` False and JM2 in
+        `session.offered` -> retire the sid, start a JM1-only HELLO carrying
+        the same pinned key and `retry_used = True`; any other reason, a second
+        hybrid_invalid, or a JM1-only offer -> `_abort` with the reason.
+        """
+        raise NotImplementedError("_on_reject is written after your three functions")
 
     # ----- 8. Timeouts and robustness (Appendix B) ------------------------------
     # Optional and not graded (handout §3, spec Appendix B). These methods must

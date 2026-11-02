@@ -16,6 +16,12 @@ dependencies = [
 [project.scripts]
 a2 = "a2:main"
 
+[project.optional-dependencies]
+ui = [
+    "monsterui>=1.0.48",
+    "python-fasthtml>=0.14.17",
+]
+
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"

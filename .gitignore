@@ -4,3 +4,11 @@
 *.synctex.gz
 .DS_Store
 *.cpython-313.pyc
+
+# private reference material, never part of the submission
+weus_2rc-main.zip
+
+# hosting kit: server config, never part of the submission
+deploy/
+# agent tutoring log (AGENTS.md: keep out of public commits)
+starter/.agent-notes/
