@@ -77,6 +77,8 @@ from ui_state import JM1, JM2, Inbox
 
 FINGERPRINT_REFRESH = 10      # seconds between re-reading an open conversation's directory key
 DIRECTORY_REFRESH = 120       # seconds between full directory passes (/users + every key)
+DIRECTORY_RETRY = 30          # seconds until the next pass after the directory was unreachable
+READ_ONLY_WORK = {"directory", "fingerprints", "fingerprint"}   # GETs: a failure is retried, not fatal
 PBKDF2_ROUNDS = 600_000
 
 
@@ -107,12 +109,13 @@ def check_password(password, encoded):
 class ProtocolLoop(threading.Thread):
     """Runs every Client call in order on one thread; the web handlers only enqueue."""
 
-    def __init__(self, runtime, inbox, *, poll_interval=2.0, auto_poll=True):
+    def __init__(self, runtime, inbox, *, poll_interval=2.0, auto_poll=True, exit_on_failure=False):
         super().__init__(name="protocol", daemon=True)
         self.runtime = runtime
         self.inbox = inbox
         self.poll_interval = poll_interval
         self.auto_poll = auto_poll
+        self.exit_on_failure = exit_on_failure   # under systemd: exit so Restart= brings a fresh driver
         self.actions = queue.Queue()
         self.stopped = threading.Event()
         self._fp_due = {}      # peer -> monotonic time of the next fingerprint refresh
@@ -132,6 +135,11 @@ class ProtocolLoop(threading.Thread):
         except PeerKeyUnavailable as exc:
             self.inbox.fingerprint_unavailable(peer, str(exc))
             return
+        except TransportError as exc:
+            # A GET /keys that failed on the wire says nothing about any session: show it,
+            # retry on the next pass, and never let it latch the Runtime (Runtime.call would).
+            self.inbox.fingerprint_unavailable(peer, f"directory unreachable: {exc}")
+            return
         if peer is None or peer == self.runtime.account:
             self.inbox.apply({"type": "fingerprint", "peer": self.runtime.account, "value": value})
         else:
@@ -150,7 +158,7 @@ class ProtocolLoop(threading.Thread):
         `Client.fingerprint`, the one place that knows §5, so a key change is detected for
         every listed user, not only the ones with an open conversation.
         """
-        listing = self.runtime.call(self.runtime.api.users)
+        listing = self.runtime.api.users()      # plain GET: not via Runtime.call, so no latch
         self.inbox.apply({"type": "users", "users": listing})
         for name in self.inbox.users:
             if name == self.runtime.account:
@@ -176,8 +184,8 @@ class ProtocolLoop(threading.Thread):
                     next_poll = now + self.poll_interval
                     self._guarded("poll", self.runtime.poll)
                 if now >= next_directory:
-                    next_directory = now + DIRECTORY_REFRESH
-                    self._guarded("directory", self.refresh_directory)
+                    ok = self._guarded("directory", self.refresh_directory)
+                    next_directory = now + (DIRECTORY_REFRESH if ok else DIRECTORY_RETRY)
                 self._guarded("fingerprints", lambda now=now: self._refresh_fingerprints(now))
                 try:
                     label, fn = self.actions.get(timeout=0.1)
@@ -185,21 +193,37 @@ class ProtocolLoop(threading.Thread):
                     continue
                 self._guarded(label, fn)
         except TransportError as exc:
+            # A poll or a send failed: the Runtime has latched (handout §3, spec §4.6) because
+            # the protocol state may be out of step with the server. Nothing in this process
+            # can continue safely; under systemd we exit and Restart= starts a fresh driver.
             self.inbox.transport_failed(str(exc))
+            if self.exit_on_failure:
+                threading.Timer(8.0, os._exit, args=(3,)).start()   # leave the message visible first
         finally:
             self.stopped.set()
 
     def _guarded(self, label, fn):
-        """Run one work item; a bug in student code is shown, not fatal. Transport failure is."""
+        """Run one work item and report whether it completed.
+
+        A bug in student code is shown, not fatal. A transport failure on a read-only
+        item (directory listing, key lookup) is a warning and `False`, so the caller
+        retries later; on a poll or a send it is fatal and propagates (§4.6).
+        """
         try:
             fn()
-        except TransportError:
-            raise
+            return True
+        except TransportError as exc:
+            if label not in READ_ONLY_WORK:
+                raise
+            self.inbox.note_system(f"{label}: course server unreachable, will retry "
+                                   f"({exc})", kind="warning")
+            return False
         except NotImplementedError as exc:
             self.inbox.note_system(f"Student TODO ({label}): {exc}", kind="error")
         except Exception as exc:     # noqa: BLE001 - a UI must survive and show the traceback
             traceback.print_exc()
             self.inbox.note_system(f"{label} raised {type(exc).__name__}: {exc}", kind="error")
+        return False
 
 
 # ----- Start-up (same steps as client.py main, README §4) --------------------------
@@ -573,9 +597,11 @@ def build_app(inbox, loop):
             items.append(Span("--jm1-only: you OFFER only the legacy suite", cls="badge dashed"))
         parts = [Div(*items, cls="row")]
         if snap["transport_failure"]:
-            parts.append(Div(H4("Transport failure"), P(f"The driver stopped (no automatic retry): "
-                                                       f"{snap['transport_failure']}. Restart the service.",
-                                                       cls="memo"), cls="notice", role="alert"))
+            parts.append(Div(H4("Transport failure"), P(
+                f"A poll or send failed and the driver stopped: {snap['transport_failure']}. "
+                "The service restarts itself within a few seconds; in-memory sessions are lost, "
+                "so reload this page and start a new handshake with your peer.",
+                cls="memo"), cls="notice", role="alert"))
         sys_entries = [entry_view(e) for e in snap["system"][-5:]]
         if sys_entries:
             parts.append(Div(*sys_entries, cls="timeline", style="min-height:0;margin-top:.5rem"))
@@ -849,6 +875,8 @@ def main(argv=None):
     parser.add_argument("--jm1-only", action="store_true", help="initiate in compatibility mode")
     parser.add_argument("--poll-interval", type=float, default=2)
     parser.add_argument("--no-auto-poll", action="store_true")
+    parser.add_argument("--exit-on-failure", action="store_true",
+                        help="exit after a fatal transport failure (for systemd Restart=)")
     parser.add_argument("--port", type=int, default=8010, help="loopback port for the web UI")
     args = parser.parse_args(argv)
     if not 1 <= args.poll_interval <= 5:
@@ -862,7 +890,7 @@ def main(argv=None):
                                 jm1_only=args.jm1_only)
         inbox.apply({"type": "ready", "username": account, "jm1_only": args.jm1_only})
         loop = ProtocolLoop(runtime, inbox, poll_interval=args.poll_interval,
-                            auto_poll=not args.no_auto_poll)
+                            auto_poll=not args.no_auto_poll, exit_on_failure=args.exit_on_failure)
         app = build_app(inbox, loop)
         loop.start()
         import uvicorn

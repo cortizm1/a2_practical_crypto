@@ -8,6 +8,7 @@ tests are skipped without them. No protocol code is exercised here: the
 
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -343,3 +344,38 @@ class LocalModeChecks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoopRobustnessChecks(unittest.TestCase):
+    """A failed directory GET is a warning and a retry, never a stopped driver (§4.6 scope)."""
+
+    def _loop(self):
+        import webui
+        self.webui = webui
+        inbox = Inbox("alice")
+        runtime = types.SimpleNamespace(api=None, client=None, account="alice",
+                                        call=lambda fn, *a, **k: fn(*a))
+        return self.webui.ProtocolLoop(runtime, inbox, auto_poll=False), inbox
+
+    def test_directory_transport_error_is_a_warning_and_returns_false(self):
+        loop, inbox = self._loop()
+        def boom():
+            raise self.webui.TransportError("GET /keys/x: transport or JSON error (URLError)")
+        self.assertFalse(loop._guarded("directory", boom))
+        self.assertEqual([e.kind for e in inbox.snapshot()["system"]], ["warning"])
+        self.assertIsNone(inbox.snapshot()["transport_failure"])
+
+    def test_poll_transport_error_still_propagates(self):
+        loop, _ = self._loop()
+        def boom():
+            raise self.webui.TransportError("GET /messages: HTTP 500")
+        with self.assertRaises(self.webui.TransportError):
+            loop._guarded("poll", boom)
+
+    def test_fingerprint_lookup_failure_marks_peer_unavailable_without_latching(self):
+        loop, inbox = self._loop()
+        def fingerprint(peer):
+            raise self.webui.TransportError("GET /keys/bob: transport or JSON error (URLError)")
+        loop.runtime.client = types.SimpleNamespace(fingerprint=fingerprint)
+        loop._fingerprint("bob")
+        self.assertIn("unreachable", inbox.snapshot()["conversations"]["bob"].fingerprint_error)

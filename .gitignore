@@ -4,6 +4,10 @@
 *.synctex.gz
 .DS_Store
 *.cpython-313.pyc
+__pycache__/
+
+# agent tutoring study aid (not a graded deliverable; kept locally)
+parts-2-3-study-guide.pdf
 
 # private reference material, never part of the submission
 weus_2rc-main.zip
