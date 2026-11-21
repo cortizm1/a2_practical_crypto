@@ -32,3 +32,27 @@ for x in P__ if x == 04
 
 And padding is well.... the padding. The actual value of the bytes is supposed to be the
 same as the number of padded bytes themselves.
+
+AS CLAUDE PUTS IT (THIS is is what it states happened):
+Claude corrections / AI contributions (factual record)
+
+Part 0 — padding
+- I wrote pkcs7_pad/pkcs7_unpad myself, no AI; padding_first_attempt.py is my unaided attempt. Claude only explained the concept after I had a misconception about what padding was (I thought padding used a random non-matching byte; corrected to "N bytes each equal to N").
+
+I wrote receive, send_text, and the FINISH handler myself, and did the Part 0 warmup without generated code.
+
+Part 1 — client
+- I wrote the review-critical core myself: receive, send_text, _seal, _on_finish.
+- Claude wrote the remaining handlers as helpers that call my code, after mine existed: _open (at my explicit request), _on_control, _on_reject, _send_hello, _abort.
+- Claude built the web UI, the test harnesses (test_records, test_handlers, test_webui), and packaging/deploy glue.
+- I verified the handshake end-to-end through my own UI; Claude ran the check suites (warmup, review_eligible, client_smoke — all pass).
+
+Parts 2/3 — exercises
+- I wrote recover_byte and its CBC derivation comment myself (several drafts; Claude gave only symptom-level hints — "no loop here," "that's forged_prev not prev_block" — never the expression).
+- Claude wrote the attack plumbing after I explained each attack: downgrade, recover, experiment, and helpers (_corrupt_ek, _padding_oracle, _recover_block).
+- Claude ran the exercises; Part 2 negotiation: pass, Part 3 recovery: pass, chain both pass.
+
+Written work
+- I wrote written.md (Part 4) and exercises/README.md myself. Claude critiqued drafts — flagged factual errors (I had the ML-KEM encapsulate/decapsulate roles reversed; I'd called AES-GCM "post-quantum" when the PQC is in the handshake) and gaps — and I revised. Claude did not write any graded answer.
+
+---
